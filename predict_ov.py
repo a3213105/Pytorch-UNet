@@ -10,8 +10,8 @@ from PIL import Image
 # from torchvision import transforms
 from pathlib import Path
 
-# from utils.data_loading import BasicDataset
-# from unet import UNet
+from utils.data_loading import BasicDataset
+from unet import UNet
 # from utils.utils import plot_img_and_mask
 
 import openvino as ov
@@ -32,6 +32,7 @@ def get_args():
     parser.add_argument('--classes', '-c', type=int, default=2, help='Number of classes')
     parser.add_argument('--loop', '-l', type=int, default=10, help='Number of classes')
     parser.add_argument('--warmup', '-w', type=int, default=2, help='Number of classes')
+    parser.add_argument('--nstreams', '-n', type=int, default=2, help='Number of ov streams')
     
     return parser.parse_args()
 
@@ -133,7 +134,7 @@ def predict_img_ov1(net, full_img, scale, n_classes, out_threshold=0.5):
         mask = torch.sigmoid(output) > out_threshold
     return mask[0].long().squeeze().numpy()
 
-def load_ov_model(model_path: str, amx: int):
+def load_ov_model(model_path: str, nstreams: int, amx: int):
     core = ov.Core()
     model = core.read_model(model=model_path)
 
@@ -148,16 +149,17 @@ def load_ov_model(model_path: str, amx: int):
             .scale(255.0)
     model = ppp.build()
         
-    stream_num=1
     data_type = 'bf16' if amx==1 else 'f16' if amx==2 else 'f32'
-    hint = 'THROUGHPUT' if stream_num>1 else 'LATENCY'
+    hint = 'THROUGHPUT' if nstreams>1 else 'LATENCY'
     config = {}
-    config['NUM_STREAMS'] = str(stream_num)
+    config['NUM_STREAMS'] = str(nstreams)
     config['PERF_COUNT'] = 'NO'
     config['INFERENCE_PRECISION_HINT'] = data_type
     config['PERFORMANCE_HINT'] = hint
     compiled_model = core.compile_model(model, 'CPU', config)
-    return compiled_model
+    num_requests = compiled_model.get_property("OPTIMAL_NUMBER_OF_INFER_REQUESTS")
+    infer_queue = AsyncInferQueue(compiled_model, num_requests)
+    return compiled_model, infer_queue
 
 def predict_img_ov(net, full_img, scale, n_classes, out_threshold=0.5):
     w, h = full_img.size
@@ -216,58 +218,97 @@ def torch_infer(in_files, out_files, net):
         et = time.perf_counter()
         print(f'Average inference time over loop runs: {(et - st)/loop:.4f} seconds')
     
-def infer(in_files, out_files, scale, mask_threshold, warmup, loop,n_classes,  net, predict_img):
-    for i, filename in enumerate(in_files):
-        logging.info(f'Predicting image {filename} ...')
-        full_img = Image.open(filename)
+def infer(in_files, scale, mask_threshold, warmup, loop,n_classes, net, predict_img):
+    for i in range(warmup) :
+        mask = predict_img(net=net, full_img=in_files[i], scale=scale,
+                           n_classes=n_classes, out_threshold=mask_threshold)
 
-        for j in range(warmup) :
-            mask = predict_img(net=net, full_img=full_img, scale=scale,
-                               n_classes=n_classes, out_threshold=mask_threshold)
-        st = time.perf_counter()
-        for j in range(loop) :
-            mask = predict_img(net=net, full_img=full_img, scale=scale,
-                               n_classes=n_classes, out_threshold=mask_threshold)
-        et = time.perf_counter()
-        print(f'Average inference time over {loop} runs: {(et - st)/loop:.4f} seconds')
+    st = time.perf_counter()
+    for i in range(loop) :
+        mask = predict_img(net=net, full_img=in_files[i], scale=scale,
+                           n_classes=n_classes, out_threshold=mask_threshold)
+    et = time.perf_counter()
+    print(f'Average inference time over {loop} runs: {(et - st)/loop:.4f} seconds')
     return mask
 
+def infer_ov(in_files, scale, mask_threshold, warmup, n_classes, infer_queue):
+    results = {}
+    def completion_callback(infer_request: InferRequest, index: any) :
+        nid = index[0]
+        full_img = index[1]
+        output = torch.from_numpy(infer_request.get_output_tensor(0).data)
+        output = F.interpolate(output, (full_img.size[1], full_img.size[0]), mode='bilinear')
+        if n_classes > 1:
+            mask = output.argmax(dim=1)
+        else:
+            mask = torch.sigmoid(output) > out_threshold
+        results[nid] = mask.long().squeeze().numpy()
+
+    
+    def prepare_input(full_img, scale):
+        w, h = full_img.size
+        newW, newH = int(scale * w), int(scale * h)
+        img = full_img.resize((newW, newH), resample=Image.BICUBIC)
+        img = np.asarray(img)
+        img = np.expand_dims(img, axis=0)
+        return img
+
+    infer_queue.set_callback(completion_callback)
+
+    for i in range(warmup):
+        img = prepare_input(in_files[i], scale)
+        infer_queue.start_async({0: img}, userdata=[i,in_files[i]])
+    infer_queue.wait_all()
+
+    results = {}
+    st = time.perf_counter()
+    for i, in_file in enumerate(in_files):
+        img = prepare_input(in_file, scale)
+        infer_queue.start_async({0: img}, userdata=[i,in_file])
+    infer_queue.wait_all()
+    et = time.perf_counter()
+    loop = len(in_files)
+    print(f'Average inference time over {loop} runs: {(et - st)/loop:.4f} seconds')
+    return results[0]
+
+def prepare_inputs(in_files, ncount) :
+    image_list = []
+    for i in range(ncount) :
+        for filename in in_files:
+            full_img = Image.open(filename)
+            image_list.append(full_img)
+            if len(image_list) >= ncount:
+                return image_list
+    return image_list
+    
 if __name__ == '__main__':
     args = get_args()
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
     in_files = args.input
-    out_files = get_output_filenames(args)
     print(f"args={args}")
     
-    # net, device, mask_values = load_torch_model(args)
-    # net.eval()
+    in_files = prepare_inputs(args.input, args.loop if args.loop > args.warmup else args.warmup)
     
-    # mask_torch = infer(in_files, out_files, args.scale, args.mask_threshold, args.warmup, args.loop, net.n_classes, 
-    #       net, predict_img_torch)
+    net, device, mask_values = load_torch_model(args)
+    net.eval()
+    
+    mask_torch = infer(in_files, args.scale, args.mask_threshold, args.warmup, args.loop, net.n_classes, 
+          net, predict_img_torch)
 
     ov_path = Path(args.model).with_suffix('.xml')
     mode_name = ['F32', 'BF16', 'F16']
     for i,name in enumerate(mode_name):            
-        ov_net = load_ov_model(ov_path, amx=i)
-        mask_ov = infer(in_files, out_files, args.scale, args.mask_threshold, args.warmup, args.loop, args.classes, 
-            ov_net, predict_img_ov)
-        # exact_equal = np.array_equal(mask_torch, mask_ov)
-        # ne_count = np.sum(mask_torch != mask_ov)
-        # print(f"{name}是否完全相等:{exact_equal}, 差异数量:{ne_count}")
+        ov_net, ov_infer_q = load_ov_model(ov_path, args.nstreams, amx=i)
+        # mask_ov = infer(in_files, args.scale, args.mask_threshold, args.warmup, args.loop, args.classes, 
+        #     ov_net, predict_img_ov)
+        mask_ov = infer_ov(in_files, args.scale, args.mask_threshold, args.warmup, args.classes, ov_infer_q)
+        exact_equal = np.array_equal(mask_torch, mask_ov)
+        ne_count = np.sum(mask_torch != mask_ov)
+        print(f"{name}是否完全相等:{exact_equal}, 差异数量:{ne_count}")
         process = psutil.Process(os.getpid())        
         # 内存使用（单位：字节）
         mem_info = process.memory_info()
         print(f"RSS: {mem_info.rss / 1024 ** 3:.2f} GB")  # 常驻内存
         print(f"VMS: {mem_info.vms / 1024 ** 3:.2f} GB")  # 虚拟内存
         del ov_net
-    # print(f"mask_torch={mask_torch.shape}, mask_ov={mask_ov.shape}")
-
-    # for i,name in enumerate(mode_name):            
-    #     ov_net = load_ov_model1(ov_path, amx=i)
-    #     mask_ov = infer(in_files, out_files, args.scale, args.mask_threshold, args.warmup, args.loop, args.classes, 
-    #         ov_net, predict_img_ov1)
-    #     exact_equal = np.array_equal(mask_torch, mask_ov)
-    #     ne_count = np.sum(mask_torch != mask_ov)
-    #     print(f"{name}是否完全相等:{exact_equal}, 差异数量:{ne_count}")
-    #     del ov_net
