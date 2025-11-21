@@ -62,8 +62,8 @@ def load_torch_model(args) :
     net = UNet(n_channels=3, n_classes=args.classes, bilinear=args.bilinear)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logging.info(f'Loading model {args.model}')
-    logging.info(f'Using device {device}')
+    # logging.info(f'Loading model {args.model}')
+    # logging.info(f'Using device {device}')
 
     net.to(device=device)
     state_dict = torch.load(args.model, map_location=device)
@@ -76,7 +76,7 @@ def load_torch_model(args) :
         ov_model = ov.convert_model(net, example_input=torch.rand(1, 3, 1024, 1024))
         ov.save_model(ov_model, ov_path, compress_to_fp16=False)
     
-    logging.info('Model loaded!')
+    # logging.info('Model loaded!')
     return net, device, mask_values
 
 def predict_img_torch(net, full_img, scale, n_classes, out_threshold=0.5, use_amp=False):
